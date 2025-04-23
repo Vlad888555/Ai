@@ -11,7 +11,6 @@ SCREEN_WIDTH = GRID_SIZE * CELL_SIZE
 SCREEN_HEIGHT = GRID_SIZE * CELL_SIZE + 50  # additional space for score
 FPS = 60
 NUM_COLORS = 6
-
 # Colors
 COLORS = [
     (255, 0, 0),    # Red

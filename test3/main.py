@@ -4,6 +4,14 @@ import pyautogui
 import cv2
 import numpy as np
 import pytesseract
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+from collections import deque
+import random
+import time
+import threading
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
@@ -45,38 +53,98 @@ class RegionSelector(tk.Toplevel):
 
 class GameMonitor:
     def __init__(self):
-        self.board_region = None
-        self.score_region = None
-        self.is_running = False
-        
         self.root = tk.Tk()
         self.root.title("AI Trainer for Match-3")
-        self.root.geometry("400x300")
+        self.root.geometry("800x600")
+        
+        # Инициализация модели
+        self.model = None
+        self.target_model = None
+        self.optimizer = optimizers.Adam(learning_rate=0.00025)
+        self.memory = deque(maxlen=10000)
+        self.batch_size = 128
+        self.gamma = 0.95
+        self.epsilon_decay = 0.997
+        self.update_target_every = 500
+        self.epsilon = 1.0
+        self.epsilon_min = 0.01
+        self.epsilon_decay = 0.9998
+        self.update_target_every = 1000
+        self.steps = 0
+        self.current_score = 0
+        self.is_running = False
+        self.penalty_counter = 0
+        self.max_penalty_steps = 5
+        self.penalty_value = -50
+        self.best_score = 0
         
         self.create_widgets()
+        self.init_visualization()
+        self.build_model()
         
-    def create_widgets(self):
-        frame = ttk.Frame(self.root, padding=20)
-        frame.pack(fill=tk.BOTH, expand=True)
-        
-        self.btn_board = ttk.Button(frame, text="1. Сохранить игровое поле", command=self.set_board)
-        self.btn_board.pack(pady=5, fill=tk.X)
-        
-        self.btn_score = ttk.Button(frame, text="2. Сохранить область счета", command=self.set_score)
-        self.btn_score.pack(pady=5, fill=tk.X)
-        
-        self.btn_train = ttk.Button(frame, text="3. Начать обучение", command=self.start_training)
-        self.btn_train.pack(pady=20, fill=tk.X)
-        
-        self.lbl_status = ttk.Label(frame, text="Статус: Ожидание настроек")
-        self.lbl_status.pack(pady=10)
-        
-        self.lbl_board = ttk.Label(frame, text="Игровое поле: не задано")
-        self.lbl_board.pack()
-        
-        self.lbl_score = ttk.Label(frame, text="Область счета: не задана")
-        self.lbl_score.pack()
 
+        self.root.bind('<KeyPress-q>', self.stop_training)
+        
+
+        self.scores = []
+        self.total_reward = 0
+        self.episode = 0
+
+    def create_widgets(self):
+
+        control_frame = ttk.Frame(self.root)
+        control_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+        
+        self.btn_board = ttk.Button(control_frame, text="1. Сохранить игровое поле", command=self.set_board)
+        self.btn_board.pack(side=tk.LEFT, padx=5)
+        
+        self.btn_score = ttk.Button(control_frame, text="2. Сохранить область счета", command=self.set_score)
+        self.btn_score.pack(side=tk.LEFT, padx=5)
+        
+        self.btn_train = ttk.Button(control_frame, text="3. Начать обучение", command=self.start_training)
+        self.btn_train.pack(side=tk.LEFT, padx=5)
+        
+        self.btn_stop = ttk.Button(control_frame, text="Стоп (Q)", command=self.stop_training)
+        self.btn_stop.pack(side=tk.LEFT, padx=5)
+        
+
+        status_frame = ttk.Frame(self.root)
+        status_frame.pack(side=tk.TOP, fill=tk.X, padx=10, pady=5)
+        
+        self.lbl_board = ttk.Label(status_frame, text="Игровое поле: не задано")
+        self.lbl_board.pack(side=tk.LEFT, padx=10)
+        
+        self.lbl_score = ttk.Label(status_frame, text="Область счета: не задана")
+        self.lbl_score.pack(side=tk.LEFT, padx=10)
+        
+        self.lbl_status = ttk.Label(status_frame, text="Статус: Ожидание настроек")
+        self.lbl_status.pack(side=tk.LEFT, padx=10)
+
+    def init_visualization(self):
+
+        self.fig = plt.Figure(figsize=(6, 4), dpi=100)
+        self.ax = self.fig.add_subplot(111)
+        self.line, = self.ax.plot([], [])
+        self.ax.set_xlabel('Шаги')
+        self.ax.set_ylabel('Счет')
+        self.ax.set_title('Прогресс обучения')
+        
+        self.canvas = FigureCanvasTkAgg(self.fig, master=self.root)
+        self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        
+        
+        stats_frame = ttk.Frame(self.root)
+        stats_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        
+        self.lbl_epsilon = ttk.Label(stats_frame, text="Epsilon: 1.0")
+        self.lbl_epsilon.pack(side=tk.LEFT, padx=10)
+        
+        self.lbl_reward = ttk.Label(stats_frame, text="Total Reward: 0")
+        self.lbl_reward.pack(side=tk.LEFT, padx=10)
+        
+        self.lbl_steps = ttk.Label(stats_frame, text="Steps: 0")
+        self.lbl_steps.pack(side=tk.LEFT, padx=10)
+    
     def set_board(self):
         selector = RegionSelector(self.root)
         self.root.wait_window(selector)
@@ -107,26 +175,202 @@ class GameMonitor:
             return int(''.join(filter(str.isdigit, text)))
         except:
             return 0
-
-    def start_training(self):
-        if not self.board_region or not self.score_region:
-            messagebox.showerror("Ошибка", "Сначала задайте обе области!")
-            return
-            
-        self.is_running = True
-        self.lbl_status.config(text="Статус: Обучение запущено")
+    
+    
+    def build_model(self):
+        # Создаем модель
+        self.model = models.Sequential([
+        layers.Input(shape=(10,10,1)),
+        layers.Conv2D(128, (3,3), activation='relu'),
+        layers.BatchNormalization(),
+        layers.Conv2D(256, (3,3), activation='relu'),
+        layers.MaxPooling2D((2,2)),
+        layers.Flatten(),
+        layers.Dense(512, activation='relu'),
+        layers.Dropout(0.4),
+        layers.Dense(180, activation='linear', kernel_regularizer='l2')
+    ])
         
-        # Здесь будет основной цикл обучения
-        while self.is_running:
-            current_score = self.read_score()
-            print(f"Текущий счет: {current_score}")
-            
-            # TODO: Добавить логику ИИ
-            # ...
-            
-            self.root.update()
-            self.root.after(1000)  # Обновление каждую секунду
+        self.model.compile(
+            optimizer=self.optimizer,
+            loss='huber',
+            metrics=['mae'],
+            weighted_metrics=['accuracy']
+        )
+        
+        self.target_model = models.clone_model(self.model)
+        self.target_model.set_weights(self.model.get_weights())
+    
+    def update_target_model(self):
+        self.target_model.set_weights(self.model.get_weights())
 
+    def get_current_state(self):
+        x, y, w, h = self.board_region
+        screenshot = pyautogui.screenshot(region=(x, y, w, h))
+        img = cv2.cvtColor(np.array(screenshot), cv2.COLOR_RGB2BGR)
+        
+        state = np.zeros((10,10), dtype=int)
+        cell_w = w // 10
+        cell_h = h // 10
+        
+        game_colors_bgr = [
+            (0, 0, 255), (0, 255, 0), (255, 0, 0),
+            (0, 255, 255), (255, 0, 255), (255, 255, 0)
+        ]
+        
+        for r in range(10):
+            for c in range(10):
+                cell = img[r*cell_h:(r+1)*cell_h, c*cell_w:(c+1)*cell_w]
+                avg_color = np.mean(cell, axis=(0,1))
+                distances = [np.linalg.norm(avg_color - color) for color in game_colors_bgr]
+                state[r,c] = np.argmin(distances)
+        
+        return state.reshape(10,10,1) / 5.0
+    
+    def select_action(self, state):
+        if np.random.rand() < self.epsilon:
+            return random.randint(0, 179)
+        else:
+            q_values = self.model.predict(np.expand_dims(state, axis=0), verbose=0)
+            return np.argmax(q_values[0])
+
+    def get_cell_center(self, row, col):
+        x = self.board_region[0] + col * (self.board_region[2]/10) + (self.board_region[2]/20)
+        y = self.board_region[1] + row * (self.board_region[3]/10) + (self.board_region[3]/20)
+        return (x, y)
+
+    def perform_action(self, action):
+        if action < 100:
+            r = action // 10
+            c = action % 10
+            if c >= 9: return 0
+            pos1, pos2 = (r, c), (r, c+1)
+        else:
+            action -= 100
+            r = action // 10
+            c = action % 10
+            if r >= 9: return 0
+            pos1, pos2 = (r, c), (r+1, c)
+        
+        try:
+            x1, y1 = self.get_cell_center(*pos1)
+            x2, y2 = self.get_cell_center(*pos2)
+            pyautogui.click(x1, y1)
+            time.sleep(0.1)
+            pyautogui.click(x2, y2)
+            time.sleep(1)
+            
+            new_score = self.read_score()
+            reward = new_score - self.current_score
+            self.current_score = new_score
+            
+            if reward == 0 and new_score == self.current_score:
+                reward -= 1
+                
+            return reward
+        except:
+            return self.penalty_value
+        
+    def start_training(self):
+        if not hasattr(self, 'board_region') or not hasattr(self, 'score_region'):
+            print("[Ошибка] Сначала задайте игровое поле и счет!")
+            return
+
+        self.is_running = True
+        self.training_thread = threading.Thread(target=self.training_loop, daemon=True)
+        self.training_thread.start()
+        print("[Система] Обучение начато")
+        
+    def training_loop(self):
+        last_score = self.current_score
+        no_progress_steps = 0
+        
+        while self.is_running:
+            state = self.get_current_state()
+            action = self.select_action(state)
+            reward = self.perform_action(action)
+            
+            if reward <= 0:
+                no_progress_steps += 1
+                if no_progress_steps >= self.max_penalty_steps:
+                    reward += self.penalty_value
+                    no_progress_steps = 0
+                    print("Наказание!")
+            else:
+                no_progress_steps = 0
+
+            next_state = self.get_current_state()
+            
+            self.memory.append((state, action, reward, next_state, False))
+            self.total_reward += reward
+            
+            if len(self.memory) >= self.batch_size:
+                self.train_on_batch()
+            
+            self.update_visualization()
+            self.root.update()
+            
+            time.sleep(0.01)
+            
+    def update_visualization(self):
+        self.scores.append(self.current_score)
+        self.line.set_data(range(len(self.scores)), self.scores)
+        self.ax.relim()
+        self.ax.autoscale_view()
+        self.canvas.draw()
+        
+        self.lbl_epsilon.config(text=f"Epsilon: {self.epsilon:.4f}")
+        self.lbl_reward.config(text=f"Total Reward: {self.total_reward}")
+        self.lbl_steps.config(text=f"Steps: {self.steps}")
+            
+    def save_model(self, path='match3_model.keras'):
+        try:
+            self.model.save(path)
+            print(f"[Система] Модель сохранена в {path}")
+        except Exception as e:
+            print(f"[Ошибка] Не удалось сохранить модель: {e}")
+
+    def load_model(self, path='match3_model.keras'):
+        try:
+            self.model = tf.keras.models.load_model(path)
+            self.target_model = tf.keras.models.clone_model(self.model)
+            self.target_model.set_weights(self.model.get_weights())
+            print("[Система] Предыдущая модель загружена")
+        except Exception as e:
+            print(f"Ошибка загрузки: {e}")
+            self.build_model()
+            
+    def train_on_batch(self):
+
+        batch = random.sample(self.memory, self.batch_size)
+        states = np.array([x[0] for x in batch])
+        actions = np.array([x[1] for x in batch])
+        rewards = np.array([x[2] for x in batch])
+        next_states = np.array([x[3] for x in batch])
+        
+        target_q = self.model.predict(states, verbose=0)
+        next_q = self.target_model.predict(next_states, verbose=0)
+        
+        for i in range(self.batch_size):
+            target_q[i][actions[i]] = rewards[i] + self.gamma * np.max(next_q[i])
+        
+
+        dataset = tf.data.Dataset.from_tensor_slices((states, target_q))
+        self.model.fit(dataset.batch(32), epochs=1, verbose=0)
+        
+        self.epsilon = max(self.epsilon_min, self.epsilon * self.epsilon_decay)
+        self.steps += 1
+        
+        if self.steps % 100 == 0:
+            self.save_model('match3_model.keras')
+    
+    def stop_training(self, event=None):
+        if self.is_running:
+            self.is_running = False
+            self.save_model()
+            print("\n[Система] Обучение остановлено")
+                 
+            
     def run(self):
         self.root.mainloop()
 
